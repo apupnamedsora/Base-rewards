@@ -9,8 +9,10 @@ import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol
 
 /**
  * @title RewardsClaim
- * @notice Allowlisted claimers can claim a fixed reward of native ETH or a single ERC-20
- *         on a cooldown. The owner must deposit funds; the contract never mints rewards.
+ * @notice Permissionless `distribute()` pushes a fixed reward of native ETH or a single ERC-20
+ *         to a fixed `recipient` on a global cooldown. The owner must deposit funds; the
+ *         contract never mints rewards. Anyone (e.g. a keeper/cron) may call `distribute`
+ *         when due — contracts cannot self-cron.
  * @dev Compatible with Base mainnet (8453) and Base Sepolia (84532).
  */
 contract RewardsClaim is Ownable, Pausable, ReentrancyGuard {
@@ -19,20 +21,19 @@ contract RewardsClaim is Ownable, Pausable, ReentrancyGuard {
     /// @notice address(0) means native ETH rewards; otherwise the ERC-20 reward token.
     address public rewardToken;
 
-    /// @notice Amount paid per successful claim (wei for ETH, token decimals for ERC-20).
+    /// @notice Amount paid per successful distribution (wei for ETH, token decimals for ERC-20).
     uint256 public rewardAmount;
 
-    /// @notice Minimum seconds between claims for the same address.
+    /// @notice Minimum seconds between distributions.
     uint256 public cooldown;
 
-    /// @notice Allowlisted claimers.
-    mapping(address => bool) public allowlist;
+    /// @notice Fixed wallet that receives each distribution.
+    address public recipient;
 
-    /// @notice Timestamp of each account's last successful claim (0 if never claimed).
-    mapping(address => uint256) public lastClaimAt;
+    /// @notice Timestamp of the last successful distribution (0 if never distributed).
+    uint256 public lastDistributedAt;
 
-    error NotAllowlisted(address account);
-    error CooldownActive(address account, uint256 readyAt);
+    error CooldownActive(uint256 readyAt);
     error InsufficientBalance(uint256 available, uint256 required);
     error ZeroAmount();
     error ZeroAddress();
@@ -41,10 +42,10 @@ contract RewardsClaim is Ownable, Pausable, ReentrancyGuard {
     error NativeDepositWhenErc20();
     error Erc20DepositWhenNative();
 
-    event Claimed(address indexed claimer, address indexed token, uint256 amount);
+    event Distributed(address indexed recipient, address indexed token, uint256 amount);
     event Deposited(address indexed from, address indexed token, uint256 amount);
     event Withdrawn(address indexed to, address indexed token, uint256 amount);
-    event AllowlistUpdated(address indexed account, bool allowed);
+    event RecipientUpdated(address indexed oldRecipient, address indexed newRecipient);
     event RewardAmountUpdated(uint256 oldAmount, uint256 newAmount);
     event CooldownUpdated(uint256 oldCooldown, uint256 newCooldown);
     event RewardTokenUpdated(address indexed oldToken, address indexed newToken);
@@ -52,19 +53,23 @@ contract RewardsClaim is Ownable, Pausable, ReentrancyGuard {
     /**
      * @param initialOwner Contract owner (deployer typically).
      * @param rewardToken_ address(0) for ETH, else ERC-20.
-     * @param rewardAmount_ Per-claim payout.
-     * @param cooldown_ Seconds between claims per address.
+     * @param rewardAmount_ Per-distribution payout.
+     * @param cooldown_ Seconds between distributions.
+     * @param recipient_ Fixed wallet that receives each distribution.
      */
     constructor(
         address initialOwner,
         address rewardToken_,
         uint256 rewardAmount_,
-        uint256 cooldown_
+        uint256 cooldown_,
+        address recipient_
     ) Ownable(initialOwner) {
         if (rewardAmount_ == 0) revert ZeroAmount();
+        if (recipient_ == address(0)) revert ZeroAddress();
         rewardToken = rewardToken_;
         rewardAmount = rewardAmount_;
         cooldown = cooldown_;
+        recipient = recipient_;
     }
 
     /// @notice Accept native ETH deposits when the reward asset is ETH.
@@ -93,32 +98,33 @@ contract RewardsClaim is Ownable, Pausable, ReentrancyGuard {
     }
 
     /**
-     * @notice Claim one reward unit if allowlisted, funded, and off cooldown.
-     * @dev Checks → Effects → Interactions; non-reentrant.
+     * @notice Push one reward unit to `recipient` if funded and off cooldown.
+     * @dev Permissionless (keeper-style). Checks → Effects → Interactions; non-reentrant.
+     *      `lastDistributedAt == 0` means never distributed → allowed.
      */
-    function claim() external nonReentrant whenNotPaused {
-        if (!allowlist[msg.sender]) revert NotAllowlisted(msg.sender);
-
-        uint256 last = lastClaimAt[msg.sender];
+    function distribute() external nonReentrant whenNotPaused {
+        uint256 last = lastDistributedAt;
         if (last != 0 && block.timestamp < last + cooldown) {
-            revert CooldownActive(msg.sender, last + cooldown);
+            revert CooldownActive(last + cooldown);
         }
 
         uint256 amount = rewardAmount;
         uint256 bal = _rewardBalance();
         if (bal < amount) revert InsufficientBalance(bal, amount);
 
-        // Effects
-        lastClaimAt[msg.sender] = block.timestamp;
+        address to = recipient;
         address token = rewardToken;
-        emit Claimed(msg.sender, token, amount);
+
+        // Effects
+        lastDistributedAt = block.timestamp;
+        emit Distributed(to, token, amount);
 
         // Interactions
         if (token == address(0)) {
-            (bool ok,) = msg.sender.call{value: amount}("");
+            (bool ok,) = to.call{value: amount}("");
             if (!ok) revert EthTransferFailed();
         } else {
-            IERC20(token).safeTransfer(msg.sender, amount);
+            IERC20(token).safeTransfer(to, amount);
         }
     }
 
@@ -130,6 +136,13 @@ contract RewardsClaim is Ownable, Pausable, ReentrancyGuard {
 
     function unpause() external onlyOwner {
         _unpause();
+    }
+
+    function setRecipient(address newRecipient) external onlyOwner {
+        if (newRecipient == address(0)) revert ZeroAddress();
+        address old = recipient;
+        recipient = newRecipient;
+        emit RecipientUpdated(old, newRecipient);
     }
 
     function setRewardAmount(uint256 newAmount) external onlyOwner {
@@ -145,25 +158,9 @@ contract RewardsClaim is Ownable, Pausable, ReentrancyGuard {
         emit CooldownUpdated(old, newCooldown);
     }
 
-    function setAllowlist(address account, bool allowed) external onlyOwner {
-        if (account == address(0)) revert ZeroAddress();
-        allowlist[account] = allowed;
-        emit AllowlistUpdated(account, allowed);
-    }
-
-    function setAllowlistBatch(address[] calldata accounts, bool allowed) external onlyOwner {
-        uint256 len = accounts.length;
-        for (uint256 i = 0; i < len; ++i) {
-            address account = accounts[i];
-            if (account == address(0)) revert ZeroAddress();
-            allowlist[account] = allowed;
-            emit AllowlistUpdated(account, allowed);
-        }
-    }
-
     /**
      * @notice Change reward token. Current reward balance must be zero first
-     *         (withdraw remaining funds), so claims cannot mix assets mid-stream.
+     *         (withdraw remaining funds), so distributions cannot mix assets mid-stream.
      * @param newToken address(0) for ETH, else ERC-20.
      */
     function setRewardToken(address newToken) external onlyOwner {
@@ -203,8 +200,9 @@ contract RewardsClaim is Ownable, Pausable, ReentrancyGuard {
         return _rewardBalance();
     }
 
-    function timeUntilClaim(address account) external view returns (uint256) {
-        uint256 last = lastClaimAt[account];
+    /// @notice Seconds until the next `distribute()` is allowed (0 if ready now).
+    function timeUntilDistribute() external view returns (uint256) {
+        uint256 last = lastDistributedAt;
         if (last == 0) return 0;
         uint256 readyAt = last + cooldown;
         if (block.timestamp >= readyAt) return 0;

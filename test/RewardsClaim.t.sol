@@ -21,18 +21,19 @@ contract RewardsClaimTest is Test {
     MockERC20 internal token;
 
     address internal owner = makeAddr("owner");
+    address internal recipient = makeAddr("recipient");
+    address internal keeper = makeAddr("keeper");
     address internal alice = makeAddr("alice");
-    address internal bob = makeAddr("bob");
-    address internal charlie = makeAddr("charlie");
+    address internal newRecipient = makeAddr("newRecipient");
 
     uint256 internal constant REWARD = 0.01 ether;
     uint256 internal constant COOLDOWN = 1 days;
     uint256 internal constant TOKEN_REWARD = 100e18;
 
-    event Claimed(address indexed claimer, address indexed token, uint256 amount);
+    event Distributed(address indexed recipient, address indexed token, uint256 amount);
     event Deposited(address indexed from, address indexed token, uint256 amount);
     event Withdrawn(address indexed to, address indexed token, uint256 amount);
-    event AllowlistUpdated(address indexed account, bool allowed);
+    event RecipientUpdated(address indexed oldRecipient, address indexed newRecipient);
     event RewardAmountUpdated(uint256 oldAmount, uint256 newAmount);
     event CooldownUpdated(uint256 oldCooldown, uint256 newCooldown);
     event RewardTokenUpdated(address indexed oldToken, address indexed newToken);
@@ -40,33 +41,42 @@ contract RewardsClaimTest is Test {
     function setUp() public {
         token = new MockERC20();
 
-        ethRewards = new RewardsClaim(owner, address(0), REWARD, COOLDOWN);
-        tokenRewards = new RewardsClaim(owner, address(token), TOKEN_REWARD, COOLDOWN);
+        ethRewards = new RewardsClaim(owner, address(0), REWARD, COOLDOWN, recipient);
+        tokenRewards = new RewardsClaim(owner, address(token), TOKEN_REWARD, COOLDOWN, recipient);
 
         vm.deal(owner, 100 ether);
+        vm.deal(keeper, 1 ether);
         vm.deal(alice, 1 ether);
         token.mint(owner, 1_000_000e18);
     }
 
-    // ─── ETH deposit & claim ───────────────────────────────────────────────
+    // ─── ETH deposit & distribute ──────────────────────────────────────────
 
-    function test_DepositETH_AndClaim() public {
-        vm.prank(owner);
-        ethRewards.setAllowlist(alice, true);
-
+    function test_DepositETH_AndDistribute() public {
         vm.prank(owner);
         ethRewards.depositETH{value: 1 ether}();
 
-        uint256 beforeBal = alice.balance;
+        uint256 beforeBal = recipient.balance;
         vm.expectEmit(true, true, false, true);
-        emit Claimed(alice, address(0), REWARD);
+        emit Distributed(recipient, address(0), REWARD);
+
+        vm.prank(keeper);
+        ethRewards.distribute();
+
+        assertEq(recipient.balance, beforeBal + REWARD);
+        assertEq(ethRewards.lastDistributedAt(), block.timestamp);
+        assertEq(ethRewards.rewardBalance(), 1 ether - REWARD);
+    }
+
+    function test_AnyoneCanDistribute() public {
+        vm.prank(owner);
+        ethRewards.depositETH{value: 1 ether}();
 
         vm.prank(alice);
-        ethRewards.claim();
+        ethRewards.distribute();
 
-        assertEq(alice.balance, beforeBal + REWARD);
-        assertEq(ethRewards.lastClaimAt(alice), block.timestamp);
-        assertEq(ethRewards.rewardBalance(), 1 ether - REWARD);
+        assertEq(recipient.balance, REWARD);
+        assertEq(ethRewards.lastDistributedAt(), block.timestamp);
     }
 
     function test_Receive_DepositsETH() public {
@@ -76,105 +86,109 @@ contract RewardsClaimTest is Test {
         assertEq(ethRewards.rewardBalance(), 0.5 ether);
     }
 
-    function test_Claim_RevertsWhenNotAllowlisted() public {
+    function test_Distribute_RevertsOnCooldown() public {
         vm.prank(owner);
         ethRewards.depositETH{value: 1 ether}();
 
-        vm.prank(alice);
-        vm.expectRevert(abi.encodeWithSelector(RewardsClaim.NotAllowlisted.selector, alice));
-        ethRewards.claim();
-    }
+        vm.prank(keeper);
+        ethRewards.distribute();
 
-    function test_Claim_RevertsOnCooldown() public {
-        vm.startPrank(owner);
-        ethRewards.setAllowlist(alice, true);
-        ethRewards.depositETH{value: 1 ether}();
-        vm.stopPrank();
-
-        vm.prank(alice);
-        ethRewards.claim();
-
-        vm.prank(alice);
+        vm.prank(keeper);
         vm.expectRevert(
-            abi.encodeWithSelector(
-                RewardsClaim.CooldownActive.selector, alice, block.timestamp + COOLDOWN
-            )
+            abi.encodeWithSelector(RewardsClaim.CooldownActive.selector, block.timestamp + COOLDOWN)
         );
-        ethRewards.claim();
+        ethRewards.distribute();
     }
 
-    function test_Claim_SucceedsAfterCooldown() public {
-        vm.startPrank(owner);
-        ethRewards.setAllowlist(alice, true);
+    function test_Distribute_SucceedsAfterCooldown() public {
+        vm.prank(owner);
         ethRewards.depositETH{value: 1 ether}();
-        vm.stopPrank();
 
-        vm.prank(alice);
-        ethRewards.claim();
+        vm.prank(keeper);
+        ethRewards.distribute();
 
         vm.warp(block.timestamp + COOLDOWN);
 
         vm.prank(alice);
-        ethRewards.claim();
+        ethRewards.distribute();
 
         assertEq(ethRewards.rewardBalance(), 1 ether - 2 * REWARD);
+        assertEq(recipient.balance, 2 * REWARD);
     }
 
-    function test_Claim_RevertsWhenUnderfunded() public {
-        vm.prank(owner);
-        ethRewards.setAllowlist(alice, true);
+    function test_Distribute_AllowsWhenNeverDistributed() public {
+        assertEq(ethRewards.lastDistributedAt(), 0);
 
-        // deposit less than one reward
+        vm.prank(owner);
+        ethRewards.depositETH{value: 1 ether}();
+
+        vm.prank(keeper);
+        ethRewards.distribute();
+
+        assertEq(ethRewards.lastDistributedAt(), block.timestamp);
+    }
+
+    function test_Distribute_RevertsWhenUnderfunded() public {
         vm.prank(owner);
         ethRewards.depositETH{value: REWARD - 1}();
 
-        vm.prank(alice);
+        vm.prank(keeper);
         vm.expectRevert(
             abi.encodeWithSelector(
                 RewardsClaim.InsufficientBalance.selector, REWARD - 1, REWARD
             )
         );
-        ethRewards.claim();
+        ethRewards.distribute();
     }
 
-    function test_Claim_RevertsWhenPaused() public {
+    function test_Distribute_RevertsWhenPaused() public {
         vm.startPrank(owner);
-        ethRewards.setAllowlist(alice, true);
         ethRewards.depositETH{value: 1 ether}();
         ethRewards.pause();
         vm.stopPrank();
 
-        vm.prank(alice);
+        vm.prank(keeper);
         vm.expectRevert(Pausable.EnforcedPause.selector);
-        ethRewards.claim();
+        ethRewards.distribute();
     }
 
-    function test_Unpause_AllowsClaimAgain() public {
+    function test_Unpause_AllowsDistributeAgain() public {
         vm.startPrank(owner);
-        ethRewards.setAllowlist(alice, true);
         ethRewards.depositETH{value: 1 ether}();
         ethRewards.pause();
         ethRewards.unpause();
         vm.stopPrank();
 
-        vm.prank(alice);
-        ethRewards.claim();
-        assertEq(ethRewards.lastClaimAt(alice), block.timestamp);
+        vm.prank(keeper);
+        ethRewards.distribute();
+        assertEq(ethRewards.lastDistributedAt(), block.timestamp);
+        assertEq(recipient.balance, REWARD);
     }
 
-    // ─── Allowlist / config ────────────────────────────────────────────────
+    // ─── Recipient / config ────────────────────────────────────────────────
 
-    function test_SetAllowlistBatch() public {
-        address[] memory accounts = new address[](2);
-        accounts[0] = alice;
-        accounts[1] = bob;
+    function test_SetRecipient() public {
+        vm.prank(owner);
+        vm.expectEmit(true, true, false, true);
+        emit RecipientUpdated(recipient, newRecipient);
+        ethRewards.setRecipient(newRecipient);
+
+        assertEq(ethRewards.recipient(), newRecipient);
 
         vm.prank(owner);
-        ethRewards.setAllowlistBatch(accounts, true);
+        ethRewards.depositETH{value: 1 ether}();
 
-        assertTrue(ethRewards.allowlist(alice));
-        assertTrue(ethRewards.allowlist(bob));
-        assertFalse(ethRewards.allowlist(charlie));
+        vm.prank(keeper);
+        ethRewards.distribute();
+
+        assertEq(newRecipient.balance, REWARD);
+        assertEq(recipient.balance, 0);
+    }
+
+    function test_SetRecipient_RevertsZeroAddress() public {
+        vm.prank(owner);
+        vm.expectRevert(RewardsClaim.ZeroAddress.selector);
+        ethRewards.setRecipient(address(0));
     }
 
     function test_SetRewardAmount_AndCooldown() public {
@@ -203,25 +217,23 @@ contract RewardsClaimTest is Test {
 
         vm.prank(alice);
         vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, alice));
-        ethRewards.setAllowlist(bob, true);
+        ethRewards.setRecipient(newRecipient);
     }
 
-    function test_TimeUntilClaim() public {
-        vm.startPrank(owner);
-        ethRewards.setAllowlist(alice, true);
+    function test_TimeUntilDistribute() public {
+        vm.prank(owner);
         ethRewards.depositETH{value: 1 ether}();
-        vm.stopPrank();
 
-        assertEq(ethRewards.timeUntilClaim(alice), 0);
+        assertEq(ethRewards.timeUntilDistribute(), 0);
 
-        vm.prank(alice);
-        ethRewards.claim();
+        vm.prank(keeper);
+        ethRewards.distribute();
 
-        assertEq(ethRewards.timeUntilClaim(alice), COOLDOWN);
+        assertEq(ethRewards.timeUntilDistribute(), COOLDOWN);
         vm.warp(block.timestamp + COOLDOWN / 2);
-        assertEq(ethRewards.timeUntilClaim(alice), COOLDOWN / 2);
+        assertEq(ethRewards.timeUntilDistribute(), COOLDOWN / 2);
         vm.warp(block.timestamp + COOLDOWN);
-        assertEq(ethRewards.timeUntilClaim(alice), 0);
+        assertEq(ethRewards.timeUntilDistribute(), 0);
     }
 
     // ─── Withdraw ──────────────────────────────────────────────────────────
@@ -248,19 +260,19 @@ contract RewardsClaimTest is Test {
 
     // ─── ERC-20 path ───────────────────────────────────────────────────────
 
-    function test_DepositERC20_AndClaim() public {
+    function test_DepositERC20_AndDistribute() public {
         vm.startPrank(owner);
-        tokenRewards.setAllowlist(alice, true);
         token.approve(address(tokenRewards), 10_000e18);
         tokenRewards.depositERC20(10_000e18);
         vm.stopPrank();
 
-        uint256 before = token.balanceOf(alice);
-        vm.prank(alice);
-        tokenRewards.claim();
+        uint256 before = token.balanceOf(recipient);
+        vm.prank(keeper);
+        tokenRewards.distribute();
 
-        assertEq(token.balanceOf(alice), before + TOKEN_REWARD);
+        assertEq(token.balanceOf(recipient), before + TOKEN_REWARD);
         assertEq(tokenRewards.rewardBalance(), 10_000e18 - TOKEN_REWARD);
+        assertEq(tokenRewards.lastDistributedAt(), block.timestamp);
     }
 
     function test_DepositETH_RevertsWhenConfiguredForERC20() public {
@@ -310,7 +322,12 @@ contract RewardsClaimTest is Test {
 
     function test_Constructor_RevertsOnZeroReward() public {
         vm.expectRevert(RewardsClaim.ZeroAmount.selector);
-        new RewardsClaim(owner, address(0), 0, COOLDOWN);
+        new RewardsClaim(owner, address(0), 0, COOLDOWN, recipient);
+    }
+
+    function test_Constructor_RevertsOnZeroRecipient() public {
+        vm.expectRevert(RewardsClaim.ZeroAddress.selector);
+        new RewardsClaim(owner, address(0), REWARD, COOLDOWN, address(0));
     }
 
     function test_ZeroAmount_DepositReverts() public {
@@ -319,22 +336,28 @@ contract RewardsClaimTest is Test {
         ethRewards.depositETH{value: 0}();
     }
 
-    function testFuzz_ClaimAfterCooldown(uint256 warpExtra) public {
+    function test_Constructor_SetsRecipient() public {
+        address fixedRecipient = 0x437066CAdcDbAd800DAa83625BcA4eA824718B42;
+        RewardsClaim c = new RewardsClaim(owner, address(0), REWARD, COOLDOWN, fixedRecipient);
+        assertEq(c.recipient(), fixedRecipient);
+        assertEq(c.lastDistributedAt(), 0);
+    }
+
+    function testFuzz_DistributeAfterCooldown(uint256 warpExtra) public {
         warpExtra = bound(warpExtra, 0, 365 days);
 
-        vm.startPrank(owner);
-        ethRewards.setAllowlist(alice, true);
+        vm.prank(owner);
         ethRewards.depositETH{value: 10 ether}();
-        vm.stopPrank();
 
-        vm.prank(alice);
-        ethRewards.claim();
+        vm.prank(keeper);
+        ethRewards.distribute();
 
         vm.warp(block.timestamp + COOLDOWN + warpExtra);
 
         vm.prank(alice);
-        ethRewards.claim();
+        ethRewards.distribute();
 
-        assertEq(ethRewards.lastClaimAt(alice), block.timestamp);
+        assertEq(ethRewards.lastDistributedAt(), block.timestamp);
+        assertEq(recipient.balance, 2 * REWARD);
     }
 }
